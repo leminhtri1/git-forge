@@ -236,24 +236,27 @@ function endsWith(buf: Buffer, tail: Buffer): boolean {
 
 function parseHead(buf: Buffer, end: number): Head | null {
   const text = buf.toString('latin1', 0, end);
-  const lines = text.split('\r\n');
-  const requestLine = lines[0]!;
-  const sp1 = requestLine.indexOf(' ');
-  const sp2 = requestLine.lastIndexOf(' ');
+  let lineEnd = text.indexOf('\r\n');
+  if (lineEnd < 0) lineEnd = text.length;
+  const sp1 = text.indexOf(' ');
+  const sp2 = text.lastIndexOf(' ', lineEnd);
   if (sp1 <= 0 || sp2 <= sp1) return null;
-  const method = requestLine.slice(0, sp1);
-  const url = requestLine.slice(sp1 + 1, sp2);
-  const version = requestLine.slice(sp2 + 1);
+  const method = text.slice(0, sp1);
+  const url = text.slice(sp1 + 1, sp2);
+  const version = text.slice(sp2 + 1, lineEnd);
   if (version !== 'HTTP/1.1' && version !== 'HTTP/1.0') return null;
   const headers: Record<string, string> = {};
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i]!;
-    const colon = line.indexOf(':');
-    if (colon <= 0) return null;
-    const name = line.slice(0, colon).trim().toLowerCase();
-    const value = line.slice(colon + 1).trim();
+  let at = lineEnd + 2;
+  while (at < text.length) {
+    let next = text.indexOf('\r\n', at);
+    if (next < 0) next = text.length;
+    const colon = text.indexOf(':', at);
+    if (colon <= at || colon > next) return null;
+    const name = text.slice(at, colon).trim().toLowerCase();
+    const value = text.slice(colon + 1, next).trim();
     const prior = headers[name];
     headers[name] = prior === undefined ? value : `${prior}, ${value}`;
+    at = next + 2;
   }
   const connection = (headers.connection ?? '').toLowerCase();
   const keepAlive = version === 'HTTP/1.1' ? !connection.includes('close') : connection.includes('keep-alive');
@@ -261,8 +264,9 @@ function parseHead(buf: Buffer, end: number): Head | null {
   const te = headers['transfer-encoding'];
   if (te !== undefined && te.toLowerCase().includes('chunked')) length = -1;
   else if (headers['content-length'] !== undefined) {
-    if (!/^\d+$/.test(headers['content-length'])) return null;
-    length = Number(headers['content-length']);
+    const raw = headers['content-length'];
+    if (!/^\d{1,15}$/.test(raw)) return null;
+    length = Number(raw);
   }
   return { method, url, headers, keepAlive, bodyStart: end + 4, length };
 }

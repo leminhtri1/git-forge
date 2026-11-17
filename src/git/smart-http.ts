@@ -120,7 +120,20 @@ function sortedRefs(repo: Repo): [string, string][] {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
+const advertisementCache = new Map<string, Buffer>();
+
+/** The v0 ref advertisement, cached per repository ref state (every push starts with one). */
 function advertiseV0(repo: Repo, service: Service): Buffer {
+  const key = `${repo.id}|${repo.refsVersion}|${repo.defaultBranch}|${service}`;
+  const cached = advertisementCache.get(key);
+  if (cached !== undefined) return cached;
+  const body = buildAdvertisementV0(repo, service);
+  if (advertisementCache.size > 4096) advertisementCache.clear();
+  advertisementCache.set(key, body);
+  return body;
+}
+
+function buildAdvertisementV0(repo: Repo, service: Service): Buffer {
   const parts: Buffer[] = [pkt(`# service=${service}\n`), FLUSH];
   const caps =
     service === 'git-upload-pack'
