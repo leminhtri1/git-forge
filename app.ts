@@ -8,8 +8,9 @@
 //   anything else                      404 {"message":"Not Found"}
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { config } from './src/config.ts';
+import { handleGit } from './src/git/smart-http.ts';
 import { HttpError, sendError, sendJson } from './src/http.ts';
+import { handleRest } from './src/rest/router.ts';
 
 export interface RunningForge {
   readonly port: number;
@@ -30,11 +31,16 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     sendJson(res, 200, { ok: true });
     return;
   }
-  if (path === '/api/v3' || path === '/api/v3/') {
-    sendJson(res, 200, { current_user_url: '/api/v3/user', meta_url: '/api/v3/meta' }, { 'x-oauth-scopes': 'repo, read:org' });
+  const query = new URLSearchParams(url.length > path.length ? url.slice(path.length + 1) : '');
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    await handleRest(req, res, path, query);
     return;
   }
+  if (path.endsWith('/info/refs') || path.endsWith('/git-upload-pack') || path.endsWith('/git-receive-pack')) {
+    if (await handleGit(req, res, path, query)) return;
+  }
   void method;
+  req.resume();
   sendError(res, 404, 'Not Found');
 }
 
@@ -79,5 +85,3 @@ export function startForge(port = 0): Promise<RunningForge> {
     });
   });
 }
-
-void config;
