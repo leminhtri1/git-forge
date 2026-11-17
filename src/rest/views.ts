@@ -123,7 +123,7 @@ export function issueView(repo: Repo, issue: Issue, urls: Urls) {
   }
   const view: Record<string, unknown> = {
     id: issue.id,
-    node_id: nodeId(issue.isPull ? 'PullRequest' : 'Issue', issue.id),
+    node_id: issue.isPull ? nodeId('PullRequest', repo.pulls.get(issue.number)?.id ?? issue.id) : nodeId('Issue', issue.id),
     url: `${api}/issues/${issue.number}`,
     repository_url: api,
     labels_url: `${api}/issues/${issue.number}/labels{/name}`,
