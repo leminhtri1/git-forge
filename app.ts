@@ -11,6 +11,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { handleGit } from './src/git/smart-http.ts';
 import { handleGraphql } from './src/graphql/endpoint.ts';
 import { HttpError, sendError, sendJson } from './src/http.ts';
+import { handleMcp } from './src/mcp/endpoint.ts';
 import { handleRest } from './src/rest/router.ts';
 
 export interface RunningForge {
@@ -35,6 +36,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const query = new URLSearchParams(url.length > path.length ? url.slice(path.length + 1) : '');
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
     await handleRest(req, res, path, query);
+    return;
+  }
+  if (path === '/mcp' || path === '/mcp/') {
+    await handleMcp(req, res);
     return;
   }
   if (path === '/api/graphql' || path === '/graphql') {
