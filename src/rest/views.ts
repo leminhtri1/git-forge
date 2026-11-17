@@ -12,7 +12,20 @@ export interface Urls {
   readonly web: string;
 }
 
+const userViews = new Map<string, ReturnType<typeof buildUserView>>();
+
+/** The viewer as a REST user object (memoised per origin: it is embedded in nearly every reply). */
 export function userView(urls: Urls) {
+  let view = userViews.get(urls.api);
+  if (view === undefined) {
+    view = buildUserView(urls);
+    if (userViews.size > 64) userViews.clear();
+    userViews.set(urls.api, view);
+  }
+  return view;
+}
+
+function buildUserView(urls: Urls) {
   const login = config.viewer.login;
   return {
     login,
