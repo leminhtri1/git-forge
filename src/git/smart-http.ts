@@ -100,16 +100,19 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, path:
 
 // ------------------------------------------------------------------ advertisements
 
+/** The v2 capability advertisement never changes: built once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pkt('version 2\n'),
+  pkt(`${AGENT}\n`),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow\n'),
+  pkt('server-option\n'),
+  pkt('object-format=sha1\n'),
+  FLUSH,
+]);
+
 function advertiseV2(): Buffer {
-  return Buffer.concat([
-    pkt('version 2\n'),
-    pkt(`${AGENT}\n`),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow\n'),
-    pkt('server-option\n'),
-    pkt('object-format=sha1\n'),
-    FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 /** Refs in advertisement order: sorted by name. */
@@ -173,7 +176,19 @@ function uploadPackV2(repo: Repo, raw: Buffer): Buffer {
   throw new Error(`unknown command ${JSON.stringify(command)}`);
 }
 
+const lsRefsCache = new Map<string, Buffer>();
+
 function lsRefs(repo: Repo, args: string[]): Buffer {
+  const key = `${repo.id}|${repo.refsVersion}|${repo.defaultBranch}|${args.join('\n')}`;
+  const cached = lsRefsCache.get(key);
+  if (cached !== undefined) return cached;
+  const body = buildLsRefs(repo, args);
+  if (lsRefsCache.size > 4096) lsRefsCache.clear();
+  lsRefsCache.set(key, body);
+  return body;
+}
+
+function buildLsRefs(repo: Repo, args: string[]): Buffer {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
