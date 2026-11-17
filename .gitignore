@@ -2,3 +2,4 @@ node_modules/
 *.log
 .tmp/
 grade-out/
+bin/forge-windows.exe
