@@ -51,19 +51,55 @@ func (r *countingReader) ReadByte() (byte, error) {
 	return b, nil
 }
 
-// inflateAt inflates one zlib stream at offset; it returns the data and the compressed length used.
-func inflateAt(buf []byte, offset int, sizeHint int) ([]byte, int, error) {
-	cr := &countingReader{data: buf[offset:]}
-	zr, err := zlib.NewReader(cr)
-	if err != nil {
+// One inflater and one deflater, reset per object: building them fresh allocates tens to hundreds of
+// KiB each, and handlers run one at a time under the global lock, so a single instance of each serves.
+var (
+	sharedInflateSrc = &countingReader{}
+	sharedInflater   io.ReadCloser
+	inflateProbe     = make([]byte, 1)
+	sharedDeflateDst bytes.Buffer
+	sharedDeflater   *zlib.Writer
+)
+
+// inflateAt inflates one zlib stream at offset into exactly size bytes (the pack entry header's size);
+// it returns the data and the compressed length used, having checked the stream's adler32 trailer.
+func inflateAt(buf []byte, offset int, size int) ([]byte, int, error) {
+	src := sharedInflateSrc
+	src.data, src.at = buf[offset:], 0
+	if sharedInflater == nil {
+		zr, err := zlib.NewReader(src)
+		if err != nil {
+			return nil, 0, err
+		}
+		sharedInflater = zr
+	} else if err := sharedInflater.(zlib.Resetter).Reset(src, nil); err != nil {
 		return nil, 0, err
 	}
-	out := bytes.NewBuffer(make([]byte, 0, sizeHint))
-	if _, err := io.Copy(out, zr); err != nil {
+	out := make([]byte, size)
+	if _, err := io.ReadFull(sharedInflater, out); err != nil {
 		return nil, 0, err
 	}
-	_ = zr.Close()
-	return out.Bytes(), cr.at, nil
+	// The stream must end exactly here: one more read reaches EOF and verifies the checksum.
+	if n, err := sharedInflater.Read(inflateProbe); n != 0 || err != io.EOF {
+		if err == nil || err == io.EOF {
+			err = fmt.Errorf("zlib stream longer than its declared size %d", size)
+		}
+		return nil, 0, err
+	}
+	return out, src.at, nil
+}
+
+// deflate compresses data with the shared writer; the result is a fresh slice.
+func deflate(data []byte) []byte {
+	sharedDeflateDst.Reset()
+	if sharedDeflater == nil {
+		sharedDeflater, _ = zlib.NewWriterLevel(&sharedDeflateDst, zlib.BestSpeed)
+	} else {
+		sharedDeflater.Reset(&sharedDeflateDst)
+	}
+	_, _ = sharedDeflater.Write(data)
+	_ = sharedDeflater.Close()
+	return append([]byte(nil), sharedDeflateDst.Bytes()...)
 }
 
 func applyDelta(base, delta []byte) ([]byte, error) {
@@ -195,20 +231,23 @@ func readPack(pack []byte, lookup func(string) *GitObject) (objects []ParsedObje
 			}
 			e.typ = t
 		}
+		if size > 128<<20 {
+			return nil, fmt.Errorf("object at %d declares %d bytes", start, size)
+		}
 		data, used, err := inflateAt(pack, at, size)
 		if err != nil {
 			return nil, fmt.Errorf("object at %d: %v", start, err)
 		}
 		at += used
-		if e.typ != "" && len(data) != size {
-			return nil, fmt.Errorf("object at %d inflated to %d bytes, header says %d", start, len(data), size)
-		}
 		e.data = data
 		entries = append(entries, e)
 		byOffset[start] = e
 	}
 
-	type result struct{ typ, id string; data []byte }
+	type result struct {
+		typ, id string
+		data    []byte
+	}
 	resolved := make(map[*entry]*result, len(entries))
 	byID := make(map[string]*result)
 	var resolve func(e *entry, depth int) (*result, error)
@@ -306,12 +345,7 @@ func packEntry(id string, obj *GitObject) []byte {
 	if cached, ok := deflatedCache[id]; ok {
 		return cached
 	}
-	var b bytes.Buffer
-	b.Write(entryHeader(obj.Type, len(obj.Data)))
-	zw, _ := zlib.NewWriterLevel(&b, zlib.BestSpeed)
-	_, _ = zw.Write(obj.Data)
-	_ = zw.Close()
-	entry := b.Bytes()
+	entry := append(entryHeader(obj.Type, len(obj.Data)), deflate(obj.Data)...)
 	if deflatedBytes+len(entry) <= deflateCacheLimit {
 		deflatedCache[id] = entry
 		deflatedBytes += len(entry)

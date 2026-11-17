@@ -560,7 +560,9 @@ func coerceInput(s *Schema, ref *typeRef, value any, where string) any {
 	if def == nil {
 		return value
 	}
-	bad := func(want string) { panic(&inputError{fmt.Sprintf("%s could not coerce %s to %s", where, string(toJSON(value)), want)}) }
+	bad := func(want string) {
+		panic(&inputError{fmt.Sprintf("%s could not coerce %s to %s", where, string(toJSON(value)), want)})
+	}
 	switch def.Kind {
 	case "SCALAR":
 		switch def.Name {

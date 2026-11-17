@@ -718,10 +718,10 @@ func mergePull(r *Repo, p *Pull, method, title, message, sha string) (string, st
 // ---------------------------------------------------------------- pull request files
 
 type ChangedFile struct {
-	Filename                     string
-	Status                       string
+	Filename                      string
+	Status                        string
 	Additions, Deletions, Changes int
-	Sha                          string
+	Sha                           string
 }
 
 func splitLines(data []byte) ([]string, bool) {

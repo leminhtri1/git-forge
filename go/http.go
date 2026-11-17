@@ -4,6 +4,10 @@ package main
 // chunked request bodies, Expect: 100-continue, TCP_NODELAY, and every response written as one buffer in
 // one Write. Requests on a connection are handled in order; handlers run under one global lock, so the
 // store sees one request at a time exactly as the Node server's single thread did.
+//
+// Per request the hot path allocates little: the head is parsed into a header slice (no map), the body
+// is a view of the connection's read buffer (handlers copy whatever they keep), and the response is
+// serialised into the connection's own reusable output buffer.
 
 import (
 	"bytes"
@@ -14,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -30,13 +35,36 @@ var reasons = map[int]string{
 	500: "Internal Server Error", 501: "Not Implemented", 503: "Service Unavailable",
 }
 
-// Request is one parsed request; the body is read whole before the handler runs.
+// Headers holds a request's headers: lowercase names; repeats joined with ", ".
+type Headers []struct{ name, value string }
+
+func (h Headers) Get(name string) string {
+	for i := range h {
+		if h[i].name == name {
+			return h[i].value
+		}
+	}
+	return ""
+}
+
+func (h *Headers) add(name, value string) {
+	for i := range *h {
+		if (*h)[i].name == name {
+			(*h)[i].value += ", " + value
+			return
+		}
+	}
+	*h = append(*h, struct{ name, value string }{name, value})
+}
+
+// Request is one parsed request; the body is read whole before the handler runs. Body is only valid
+// while the handler runs (it is a view of the connection's buffer).
 type Request struct {
 	Method  string
 	URL     string
 	Path    string
 	RawQ    string
-	Headers map[string]string // lowercase names; repeats joined with ", "
+	Headers Headers
 	Body    []byte
 	query   url.Values
 }
@@ -51,7 +79,7 @@ func (r *Request) Query() url.Values {
 	return r.query
 }
 
-func (r *Request) Header(name string) string { return r.Headers[name] }
+func (r *Request) Header(name string) string { return r.Headers.Get(name) }
 
 // Response is what a handler answers; the server serialises it.
 type Response struct {
@@ -67,16 +95,23 @@ func (r *Response) Add(name, value string) *Response {
 
 const jsonType = "application/json; charset=utf-8"
 
-var requestCounter uint64
-var requestMu sync.Mutex
+var requestCounter atomic.Uint64
 
-// nextRequestID is a fresh, non-empty request id (hex counter, GitHub-like shape).
+const upperHex = "0123456789ABCDEF"
+
+// nextRequestID is a fresh, non-empty request id (hex counter, GitHub-like shape: F0RG:0000002A).
 func nextRequestID() string {
-	requestMu.Lock()
-	requestCounter++
-	n := requestCounter
-	requestMu.Unlock()
-	return fmt.Sprintf("F0RG:%08X", n)
+	n := requestCounter.Add(1)
+	var b [13]byte
+	copy(b[:], "F0RG:")
+	for i := 12; i >= 5; i-- {
+		b[i] = upperHex[n&0xf]
+		n >>= 4
+	}
+	if n == 0 {
+		return string(b[:])
+	}
+	return fmt.Sprintf("F0RG:%08X", requestCounter.Load())
 }
 
 func jsonBytesResp(status int, body []byte) *Response {
@@ -110,9 +145,15 @@ func emptyResp(status int) *Response {
 	return &Response{Status: status, Headers: [][2]string{{"x-github-request-id", nextRequestID()}}}
 }
 
+var lastAuthHeader string // the last header that matched the token: most requests repeat it verbatim
+
 // isAuthorized: Bearer/token <token>, or Basic whose password is the token (a git credential helper).
 func isAuthorized(r *Request) bool {
-	header := strings.TrimSpace(r.Headers["authorization"])
+	raw := r.Headers.Get("authorization")
+	if raw != "" && raw == lastAuthHeader {
+		return true
+	}
+	header := strings.TrimSpace(raw)
 	space := strings.IndexByte(header, ' ')
 	if space < 0 {
 		return false
@@ -139,14 +180,18 @@ func isAuthorized(r *Request) bool {
 	default:
 		return false
 	}
-	if config.Token == "" {
-		return presented != ""
+	ok := presented != ""
+	if config.Token != "" {
+		ok = presented == config.Token
 	}
-	return presented == config.Token
+	if ok {
+		lastAuthHeader = raw
+	}
+	return ok
 }
 
 func originOf(r *Request) string {
-	host := r.Headers["host"]
+	host := r.Headers.Get("host")
 	if host == "" {
 		host = "localhost"
 	}
@@ -177,25 +222,30 @@ func serve(ln net.Listener, handler Handler) {
 
 type head struct {
 	method, target string
-	headers        map[string]string
+	headers        Headers
 	keepAlive      bool
 	bodyStart      int
 	length         int // -1: chunked
 }
 
+const readChunk = 64 * 1024
+
 func serveConn(conn net.Conn, handler Handler) {
 	defer conn.Close()
-	buf := make([]byte, 0, 16*1024)
-	tmp := make([]byte, 64*1024)
+	buf := make([]byte, 0, readChunk)
+	out := make([]byte, 0, 16*1024)
+	// read appends straight into buf's spare capacity: one syscall reads up to 64 KiB.
 	read := func() bool {
-		n, err := conn.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+		if cap(buf)-len(buf) < readChunk/2 {
+			grown := make([]byte, len(buf), 2*cap(buf)+readChunk)
+			copy(grown, buf)
+			buf = grown
 		}
+		n, err := conn.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
 		return err == nil || n > 0
 	}
 	for {
-		// the head
 		end := bytes.Index(buf, crlfcrlf)
 		for end < 0 {
 			if len(buf) > maxHead {
@@ -216,10 +266,9 @@ func serveConn(conn net.Conn, handler Handler) {
 			writeFail(conn, 413)
 			return
 		}
-		// the body
 		continued := false
 		maybeContinue := func() {
-			if !continued && strings.EqualFold(h.headers["expect"], "100-continue") {
+			if !continued && strings.EqualFold(h.headers.Get("expect"), "100-continue") {
 				continued = true
 				_, _ = conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 			}
@@ -233,7 +282,7 @@ func serveConn(conn net.Conn, handler Handler) {
 					return
 				}
 			}
-			body = buf[h.bodyStart : h.bodyStart+h.length]
+			body = buf[h.bodyStart : h.bodyStart+h.length : h.bodyStart+h.length]
 			consumed = h.bodyStart + h.length
 		} else {
 			for {
@@ -257,16 +306,23 @@ func serveConn(conn net.Conn, handler Handler) {
 		if q := strings.IndexByte(h.target, '?'); q >= 0 {
 			path, rawQ = h.target[:q], h.target[q+1:]
 		}
-		req := &Request{Method: h.method, URL: h.target, Path: path, RawQ: rawQ, Headers: h.headers, Body: append([]byte(nil), body...)}
+		req := &Request{Method: h.method, URL: h.target, Path: path, RawQ: rawQ, Headers: h.headers, Body: body}
 		resp := safeHandle(handler, req)
-		out := serialize(resp, h.method == "HEAD", h.keepAlive)
+		out = serialize(out[:0], resp, h.method == "HEAD", h.keepAlive)
 		if _, err := conn.Write(out); err != nil {
 			return
 		}
+		if cap(out) > 4*1024*1024 {
+			out = make([]byte, 0, 16*1024) // do not pin a large clone pack per idle connection
+		}
 		// keep what follows (a pipelined request), moved to the front of the buffer
-		rest := len(buf) - consumed
-		copy(buf, buf[consumed:])
+		rest := copy(buf, buf[consumed:])
 		buf = buf[:rest]
+		if cap(buf) > 4*1024*1024 && rest < readChunk {
+			small := make([]byte, rest, readChunk)
+			copy(small, buf)
+			buf = small
+		}
 		if !h.keepAlive {
 			return
 		}
@@ -289,42 +345,41 @@ func safeHandle(handler Handler, req *Request) (resp *Response) {
 	return handler(req)
 }
 
-func serialize(resp *Response, isHead, keepAlive bool) []byte {
-	var b bytes.Buffer
+// serialize appends status line, headers and body to out.
+func serialize(out []byte, resp *Response, isHead, keepAlive bool) []byte {
 	reason := reasons[resp.Status]
 	if reason == "" {
 		reason = "Unknown"
 	}
-	b.Grow(256 + len(resp.Body))
-	b.WriteString("HTTP/1.1 ")
-	b.WriteString(strconv.Itoa(resp.Status))
-	b.WriteByte(' ')
-	b.WriteString(reason)
-	b.WriteString("\r\n")
+	out = append(out, "HTTP/1.1 "...)
+	out = strconv.AppendInt(out, int64(resp.Status), 10)
+	out = append(out, ' ')
+	out = append(out, reason...)
+	out = append(out, "\r\n"...)
 	sawLength := false
 	for _, kv := range resp.Headers {
-		if strings.EqualFold(kv[0], "content-length") {
+		if len(kv[0]) == 14 && strings.EqualFold(kv[0], "content-length") {
 			sawLength = true
 		}
-		b.WriteString(kv[0])
-		b.WriteString(": ")
-		b.WriteString(kv[1])
-		b.WriteString("\r\n")
+		out = append(out, kv[0]...)
+		out = append(out, ": "...)
+		out = append(out, kv[1]...)
+		out = append(out, "\r\n"...)
 	}
 	noBody := resp.Status == 204 || resp.Status == 304
 	if !sawLength && !noBody {
-		b.WriteString("content-length: ")
-		b.WriteString(strconv.Itoa(len(resp.Body)))
-		b.WriteString("\r\n")
+		out = append(out, "content-length: "...)
+		out = strconv.AppendInt(out, int64(len(resp.Body)), 10)
+		out = append(out, "\r\n"...)
 	}
 	if !keepAlive {
-		b.WriteString("connection: close\r\n")
+		out = append(out, "connection: close\r\n"...)
 	}
-	b.WriteString("\r\n")
+	out = append(out, "\r\n"...)
 	if !isHead && !noBody {
-		b.Write(resp.Body)
+		out = append(out, resp.Body...)
 	}
-	return b.Bytes()
+	return out
 }
 
 func writeFail(conn net.Conn, status int) {
@@ -344,7 +399,7 @@ func parseHead(buf []byte, end int) (head, bool) {
 	if sp1 <= 0 || sp2 <= sp1 {
 		return head{}, false
 	}
-	h := head{method: line[:sp1], target: line[sp1+1 : sp2], headers: make(map[string]string, 12), bodyStart: end + 4}
+	h := head{method: line[:sp1], target: line[sp1+1 : sp2], headers: make(Headers, 0, 12), bodyStart: end + 4}
 	version := line[sp2+1:]
 	if version != "HTTP/1.1" && version != "HTTP/1.0" {
 		return head{}, false
@@ -362,30 +417,34 @@ func parseHead(buf []byte, end int) (head, bool) {
 		if colon <= 0 {
 			return head{}, false
 		}
-		name := strings.ToLower(strings.TrimSpace(l[:colon]))
-		value := strings.TrimSpace(l[colon+1:])
-		if prior, ok := h.headers[name]; ok {
-			h.headers[name] = prior + ", " + value
-		} else {
-			h.headers[name] = value
-		}
+		h.headers.add(lowerASCII(strings.TrimSpace(l[:colon])), strings.TrimSpace(l[colon+1:]))
 		at = next + 2
 	}
-	connection := strings.ToLower(h.headers["connection"])
+	connection := lowerASCII(h.headers.Get("connection"))
 	if version == "HTTP/1.1" {
 		h.keepAlive = !strings.Contains(connection, "close")
 	} else {
 		h.keepAlive = strings.Contains(connection, "keep-alive")
 	}
-	if strings.Contains(strings.ToLower(h.headers["transfer-encoding"]), "chunked") {
+	if te := h.headers.Get("transfer-encoding"); te != "" && strings.Contains(lowerASCII(te), "chunked") {
 		h.length = -1
-	} else if cl, ok := h.headers["content-length"]; ok {
+	} else if cl := h.headers.Get("content-length"); cl != "" {
 		if !digitsRE.MatchString(cl) || len(cl) > 15 {
 			return head{}, false
 		}
 		h.length, _ = strconv.Atoi(cl)
 	}
 	return h, true
+}
+
+// lowerASCII lowercases without allocating when the text is already lowercase.
+func lowerASCII(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			return strings.ToLower(s)
+		}
+	}
+	return s
 }
 
 const (

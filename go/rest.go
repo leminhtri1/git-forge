@@ -123,7 +123,7 @@ func fastIssueGet(r *Request) *Response {
 	if m == nil || !isAuthorized(r) {
 		return nil
 	}
-	key := r.Headers["host"] + "|" + r.Path
+	key := r.Headers.Get("host") + "|" + r.Path
 	if c, ok := issueCache[key]; ok && c.version == mutationVersion {
 		return jsonBytesResp(200, c.body)
 	}

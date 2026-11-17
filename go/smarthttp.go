@@ -28,8 +28,16 @@ const maxPktPayload = 65516
 var flushPkt = []byte("0000")
 var delimPkt = []byte("0001")
 
+// pktLen writes a pkt-line length as four lowercase hex digits.
+func pktLen(b *bytes.Buffer, n int) {
+	b.WriteByte(hexDigits[(n>>12)&0xf])
+	b.WriteByte(hexDigits[(n>>8)&0xf])
+	b.WriteByte(hexDigits[(n>>4)&0xf])
+	b.WriteByte(hexDigits[n&0xf])
+}
+
 func pkt(b *bytes.Buffer, payload string) {
-	fmt.Fprintf(b, "%04x", len(payload)+4)
+	pktLen(b, len(payload)+4)
 	b.WriteString(payload)
 }
 
@@ -40,7 +48,7 @@ func sideband(b *bytes.Buffer, band byte, data []byte) {
 		if end > len(data) {
 			end = len(data)
 		}
-		fmt.Fprintf(b, "%04x", end-at+5)
+		pktLen(b, end-at+5)
 		b.WriteByte(band)
 		b.Write(data[at:end])
 	}
@@ -114,7 +122,7 @@ func textResp(status int, text string, extra ...[2]string) *Response {
 }
 
 func wantsV2(r *Request) bool {
-	for _, part := range strings.Split(r.Headers["git-protocol"], ":") {
+	for _, part := range strings.Split(r.Headers.Get("git-protocol"), ":") {
 		if strings.TrimSpace(part) == "version=2" {
 			return true
 		}
@@ -190,7 +198,7 @@ func handleGit(r *Request) *Response {
 
 // decodeBody undoes a gzip or deflate content-encoding (real git gzips large bodies).
 func decodeBody(r *Request) ([]byte, error) {
-	switch strings.ToLower(r.Headers["content-encoding"]) {
+	switch strings.ToLower(r.Headers.Get("content-encoding")) {
 	case "gzip", "x-gzip":
 		zr, err := gzip.NewReader(bytes.NewReader(r.Body))
 		if err != nil {

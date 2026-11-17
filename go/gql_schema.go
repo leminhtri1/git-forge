@@ -908,7 +908,9 @@ func buildGitHubSchema() *Schema {
 	issue := objDef("Issue", []string{"Node", "Labelable", "Comment"}, flatten([]*FieldDef{
 		f("id", "ID!", func(v any, _ map[string]any) any { return nodeID("Issue", iv(v).issue.ID) }),
 		f("databaseId", "Int", func(v any, _ map[string]any) any { return iv(v).issue.ID }),
-		f("url", "URI!", func(v any, _ map[string]any) any { return webURL(fmt.Sprintf("%s/issues/%d", iv(v).repo.FullName(), iv(v).issue.Number)) }),
+		f("url", "URI!", func(v any, _ map[string]any) any {
+			return webURL(fmt.Sprintf("%s/issues/%d", iv(v).repo.FullName(), iv(v).issue.Number))
+		}),
 		f("state", "IssueState!", func(v any, _ map[string]any) any { return strings.ToUpper(iv(v).issue.State) }),
 		f("stateReason", "IssueStateReason", func(v any, _ map[string]any) any {
 			if sr := iv(v).issue.StateReason; sr != nil {
@@ -922,7 +924,9 @@ func buildGitHubSchema() *Schema {
 	pull := objDef("PullRequest", []string{"Node", "Labelable", "Comment"}, flatten([]*FieldDef{
 		f("id", "ID!", func(v any, _ map[string]any) any { return nodeID("PullRequest", pv(v).pull.ID) }),
 		f("databaseId", "Int", func(v any, _ map[string]any) any { return pv(v).pull.ID }),
-		f("url", "URI!", func(v any, _ map[string]any) any { return webURL(fmt.Sprintf("%s/pull/%d", pv(v).repo.FullName(), pv(v).pull.Number)) }),
+		f("url", "URI!", func(v any, _ map[string]any) any {
+			return webURL(fmt.Sprintf("%s/pull/%d", pv(v).repo.FullName(), pv(v).pull.Number))
+		}),
 		f("state", "PullRequestState!", func(v any, _ map[string]any) any { return pullState(pv(v).pull) }),
 		f("merged", "Boolean!", func(v any, _ map[string]any) any { return pv(v).pull.Merged }),
 		f("mergedAt", "DateTime", func(v any, _ map[string]any) any { return nullable(pv(v).pull.MergedAt) }),

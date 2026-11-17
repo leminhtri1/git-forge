@@ -42,6 +42,9 @@ func route(r *Request) *Response {
 	switch {
 	case path == "/healthz":
 		return jsonResp(200, Obj{{"ok", true}})
+	case path == "/__profile/stop" && profileFile != nil:
+		stopProfile()
+		return jsonResp(200, Obj{{"ok", true}})
 	case path == "/api/v3" || strings.HasPrefix(path, "/api/v3/"):
 		return handleRest(r)
 	case path == "/mcp" || path == "/mcp/":
@@ -57,9 +60,20 @@ func route(r *Request) *Response {
 }
 
 func main() {
-	runtime.GOMAXPROCS(2)
+	// One P: requests run one at a time under the global lock anyway, and fewer runtime threads mean fewer
+	// futex wake-ups and context switches (costly under gVisor). Two CPUs are shared with the suite; the limit keeps the heap well inside 1 GiB
+	// while a high GC percent makes collections rare (the store is small; most garbage is short-lived).
+	// FORGE_GOMAXPROCS and FORGE_GOGC override the defaults for experiments.
+	procs, gogc := 1, 800
+	if n, err := strconv.Atoi(os.Getenv("FORGE_GOMAXPROCS")); err == nil && n > 0 {
+		procs = n
+	}
+	if n, err := strconv.Atoi(os.Getenv("FORGE_GOGC")); err == nil && n > 0 {
+		gogc = n
+	}
+	runtime.GOMAXPROCS(procs)
 	debug.SetMemoryLimit(700 << 20)
-	debug.SetGCPercent(400)
+	debug.SetGCPercent(gogc)
 	loadConfig()
 	githubSchema = buildGitHubSchema()
 
@@ -73,5 +87,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("PORT %d\n", ln.Addr().(*net.TCPAddr).Port)
+	if prefix := os.Getenv("FORGE_PROFILE"); prefix != "" {
+		startProfile(prefix)
+	}
 	serve(ln, route)
 }
