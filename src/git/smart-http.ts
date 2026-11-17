@@ -2,7 +2,7 @@
 // git-receive-pack (v0, report-status, side-band-64k, delete-refs). No git binary: the object graph is
 // walked here and packs are written by pack.ts.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Req as IncomingMessage, Res as ServerResponse } from '../http.ts';
 import { config } from '../config.ts';
 import { isAuthorized, nextRequestId, readBody } from '../http.ts';
 import { lookupRepo, type Repo } from '../store.ts';

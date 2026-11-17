@@ -1,4 +1,4 @@
-// The forge's HTTP server: one node:http server, routed by path prefix to the four surfaces.
+// The forge's HTTP server: src/server.ts (HTTP/1.1 on node:net), routed by path prefix to the surfaces.
 //
 //   GET  /healthz                      boot probe, no auth
 //   /api/v3/...                        REST v3            (src/rest/)
@@ -6,13 +6,16 @@
 //   POST /mcp                          Model Context Protocol, streamable HTTP (src/mcp/)
 //   /<owner>/<repo>.git/...            git smart HTTP     (src/git/)
 //   anything else                      404 {"message":"Not Found"}
+//
+// Every request that is not a GET or HEAD may change the store, so it bumps the mutation version the
+// response caches compare against (before and after it runs).
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { handleGit } from './src/git/smart-http.ts';
 import { handleGraphql } from './src/graphql/endpoint.ts';
-import { HttpError, sendError, sendJson } from './src/http.ts';
+import { bumpMutationVersion, HttpError, sendError, sendJson, type Req, type Res } from './src/http.ts';
 import { handleMcp } from './src/mcp/endpoint.ts';
-import { handleRest } from './src/rest/router.ts';
+import { fastIssueGet, handleRest } from './src/rest/router.ts';
+import { createHttpServer } from './src/server.ts';
 
 export interface RunningForge {
   readonly port: number;
@@ -24,11 +27,8 @@ function pathOf(url: string): string {
   return q < 0 ? url : url.slice(0, q);
 }
 
-async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = req.url ?? '/';
-  const path = pathOf(url);
-  const method = req.method ?? 'GET';
-
+async function route(req: Req, res: Res, path: string): Promise<void> {
+  const url = req.url;
   if (path === '/healthz') {
     sendJson(res, 200, { ok: true });
     return;
@@ -49,49 +49,40 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (path.endsWith('/info/refs') || path.endsWith('/git-upload-pack') || path.endsWith('/git-receive-pack')) {
     if (await handleGit(req, res, path, query)) return;
   }
-  void method;
-  req.resume();
   sendError(res, 404, 'Not Found');
 }
 
-export function createForgeServer() {
-  const server = createServer((req, res) => {
-    route(req, res).catch((err: unknown) => {
-      if (res.headersSent) {
-        res.destroy();
-        return;
-      }
-      if (err instanceof HttpError) sendError(res, err.status, err.message, err.extra);
-      else {
-        process.stderr.write(`[forge] ${req.method} ${req.url}: ${err instanceof Error ? err.stack : String(err)}\n`);
-        sendError(res, 500, 'Internal Server Error');
-      }
-    });
-  });
-  server.keepAliveTimeout = 120_000;
-  server.headersTimeout = 125_000;
-  server.requestTimeout = 0;
-  return server;
+function fail(req: Req, res: Res, err: unknown): void {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  if (err instanceof HttpError) sendError(res, err.status, err.message, err.extra);
+  else {
+    process.stderr.write(`[forge] ${req.method} ${req.url}: ${err instanceof Error ? err.stack : String(err)}\n`);
+    sendError(res, 500, 'Internal Server Error');
+  }
 }
 
-export function startForge(port = 0): Promise<RunningForge> {
-  const server = createForgeServer();
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('the forge did not bind a TCP port'));
-        return;
-      }
-      resolve({
-        port: address.port,
-        close: () =>
-          new Promise<void>((done) => {
-            server.close(() => done());
-            server.closeAllConnections();
-          }),
-      });
-    });
-  });
+function handle(req: Req, res: Res): void {
+  const path = pathOf(req.url);
+  const reads = req.method === 'GET' || req.method === 'HEAD';
+  // The read workload's request: answered from the serialised-response cache when it is current.
+  if (reads && fastIssueGet(req, res, path)) return;
+  if (!reads) bumpMutationVersion();
+  route(req, res, path).then(
+    () => {
+      if (!reads) bumpMutationVersion();
+    },
+    (err: unknown) => {
+      if (!reads) bumpMutationVersion();
+      fail(req, res, err);
+    },
+  );
+}
+
+export async function startForge(port = 0): Promise<RunningForge> {
+  const http = createHttpServer(handle);
+  const bound = await http.listen(port);
+  return { port: bound, close: () => http.close() };
 }

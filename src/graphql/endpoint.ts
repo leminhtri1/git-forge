@@ -1,7 +1,7 @@
 // POST /api/graphql: GitHub's GraphQL v4 endpoint. An unauthenticated request is 401; a body that is a
 // JSON array is a batch and answers an array of results in order.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Req as IncomingMessage, Res as ServerResponse } from '../http.ts';
 import { HttpError, isAuthorized, readBody, sendError, sendJson } from '../http.ts';
 import { executeBody } from './execute.ts';
 import { githubSchema } from './schema.ts';

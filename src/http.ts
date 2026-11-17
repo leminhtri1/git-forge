@@ -1,8 +1,35 @@
 // HTTP plumbing shared by every surface: body reading, JSON replies, request ids and the bearer check.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import { gunzipSync, inflateSync } from 'node:zlib';
 import { config } from './config.ts';
+
+/** A request as src/server.ts hands it over: head parsed, body already read whole. */
+export interface Req {
+  readonly method: string;
+  readonly url: string;
+  /** Lowercase names; repeated headers joined with ", ". */
+  readonly headers: Readonly<Record<string, string | undefined>>;
+  readonly body: Buffer;
+  /** Kept for handlers written against node:http; the body is already consumed. */
+  resume(): void;
+}
+
+/** A response: the head is buffered by writeHead, and end() writes head and body in one write. */
+export interface Res {
+  readonly headersSent: boolean;
+  writeHead(status: number, headers?: Record<string, string | number>): void;
+  end(body?: Buffer | string): void;
+  destroy(): void;
+}
+
+type IncomingMessage = Req;
+type ServerResponse = Res;
+
+/** A request mutated the store (any method but GET/HEAD): response caches compare against this. */
+export let mutationVersion = 0;
+export function bumpMutationVersion(): void {
+  mutationVersion += 1;
+}
 
 export const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -45,34 +72,31 @@ export function sendEmpty(res: ServerResponse, status: number, headers: Record<s
   res.end();
 }
 
-/** Read the whole request body, undoing a gzip or deflate content-encoding (real git gzips large bodies). */
-export function readBody(req: IncomingMessage, limit = 512 * 1024 * 1024): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > limit) {
-        reject(new HttpError(413, 'request body too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      let body = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
-      const encoding = String(req.headers['content-encoding'] ?? '').toLowerCase();
-      try {
-        if (encoding === 'gzip' || encoding === 'x-gzip') body = gunzipSync(body);
-        else if (encoding === 'deflate') body = inflateSync(body);
-      } catch {
-        reject(new HttpError(400, 'could not decode the request body'));
-        return;
-      }
-      resolve(body);
-    });
-    req.on('error', reject);
-  });
+/** The request body, undoing a gzip or deflate content-encoding (real git gzips large bodies). */
+export function bodyOf(req: IncomingMessage, limit = 512 * 1024 * 1024): Buffer {
+  let body = req.body;
+  const encoding = (req.headers['content-encoding'] ?? '').toLowerCase();
+  if (encoding !== '' && encoding !== 'identity') {
+    try {
+      if (encoding === 'gzip' || encoding === 'x-gzip') body = gunzipSync(body);
+      else if (encoding === 'deflate') body = inflateSync(body);
+    } catch {
+      throw new HttpError(400, 'could not decode the request body');
+    }
+  }
+  if (body.length > limit) throw new HttpError(413, 'request body too large');
+  return body;
+}
+
+/** bodyOf, for callers written to await it. */
+export async function readBody(req: IncomingMessage, limit = 512 * 1024 * 1024): Promise<Buffer> {
+  return bodyOf(req, limit);
+}
+
+/** Answer with JSON bytes already serialised (the response caches). */
+export function sendJsonBytes(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string | number> = {}): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': body.length, 'x-github-request-id': nextRequestId(), ...headers });
+  res.end(body);
 }
 
 /** Parse a JSON request body; an empty body is `{}`, malformed JSON is a 400. */

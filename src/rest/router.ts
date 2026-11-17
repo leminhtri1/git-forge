@@ -1,10 +1,10 @@
 // REST v3 under /api/v3: every route, matched on path segments. Errors are JSON {message}; every reply
 // carries X-GitHub-Request-Id (src/http.ts).
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Req as IncomingMessage, Res as ServerResponse } from '../http.ts';
 import { config } from '../config.ts';
 import { isTreeMode, parseTree } from '../git/objects.ts';
-import { HttpError, isAuthorized, originOf, parseJsonBody, readBody, sendEmpty, sendError, sendJson } from '../http.ts';
+import { HttpError, isAuthorized, mutationVersion, originOf, parseJsonBody, readBody, sendEmpty, sendError, sendJson, sendJsonBytes } from '../http.ts';
 import {
   addComment,
   createIssue,
@@ -29,7 +29,7 @@ import {
   updateRef,
   updateRepository,
 } from '../ops.ts';
-import { isViewer, store, tick, type Issue, type Repo } from '../store.ts';
+import { isViewer, lookupRepo, store, tick, type Issue, type Repo } from '../store.ts';
 import {
   branchView,
   commentView,
@@ -91,6 +91,45 @@ function sendPage<T>(ctx: Ctx, items: readonly T[], view: (item: T) => unknown, 
 function intParam(value: string | undefined): number {
   if (value === undefined || !/^\d+$/.test(value)) throw notFound();
   return Number(value);
+}
+
+// ------------------------------------------------------------------ the single-issue read cache
+
+const ISSUE_PATH = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
+const issueCache = new Map<string, { version: number; body: Buffer }>();
+
+/**
+ * GET /api/v3/repos/{o}/{r}/issues/{n}, served from serialised bytes while no request has mutated the
+ * store since they were made. Answers false (the normal router takes over) for anything else: no token,
+ * an unknown repository or issue, or a path it does not cover.
+ */
+export function fastIssueGet(req: IncomingMessage, res: ServerResponse, path: string): boolean {
+  if (req.method !== 'GET') return false;
+  const match = ISSUE_PATH.exec(path);
+  if (match === null || !isAuthorized(req)) return false;
+  const key = `${req.headers.host ?? ''}|${path}`;
+  const cached = issueCache.get(key);
+  if (cached !== undefined && cached.version === mutationVersion) {
+    sendJsonBytes(res, 200, cached.body);
+    return true;
+  }
+  let owner: string;
+  let name: string;
+  try {
+    owner = decodeURIComponent(match[1]!);
+    name = decodeURIComponent(match[2]!);
+  } catch {
+    return false;
+  }
+  const repo = lookupRepo(owner, name);
+  const issue = repo?.issues.get(Number(match[3]));
+  if (repo === undefined || issue === undefined) return false;
+  const origin = originOf(req);
+  const body = Buffer.from(JSON.stringify(issueView(repo, issue, { api: `${origin}/api/v3`, web: origin })), 'utf8');
+  if (issueCache.size > 50_000) issueCache.clear();
+  issueCache.set(key, { version: mutationVersion, body });
+  sendJsonBytes(res, 200, body);
+  return true;
 }
 
 // ------------------------------------------------------------------ entry point

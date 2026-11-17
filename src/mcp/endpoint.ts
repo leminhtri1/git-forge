@@ -5,7 +5,7 @@
 // `notifications/initialized`). No session is kept: every request carries the bearer token and stands on
 // its own, so concurrent requests never interfere. Answers are application/json.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Req as IncomingMessage, Res as ServerResponse } from '../http.ts';
 import { config } from '../config.ts';
 import { HttpError, isAuthorized, nextRequestId, originOf, readBody } from '../http.ts';
 import { findTool, InvalidArguments, TOOL_LIST } from './tools.ts';
