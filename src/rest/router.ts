@@ -373,7 +373,7 @@ async function contentRoutes(ctx: Ctx, repo: Repo, path: string): Promise<void> 
   if (method === 'PUT') {
     const result = putFile(repo, path, await ctx.body());
     return sendJson(res, result.created ? 201 : 200, {
-      content: contentEntryView(repo, result.path, '100644', result.blobId, result.size, result.branch, urls),
+      content: { ...contentEntryView(repo, result.path, '100644', result.blobId, result.size, result.branch, urls), encoding: 'base64' },
       commit: gitCommitView(repo, result.commitId, urls),
     });
   }
